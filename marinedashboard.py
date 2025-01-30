@@ -3,7 +3,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import difflib
-
+pip freeze > requirements.txt
 st.title("Marine Data Analysis Dashboard 🚢🐟")
 
 uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
