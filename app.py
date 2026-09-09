@@ -32,15 +32,16 @@ PRIMARY_COLOR = "#0E7C7B"
 st.markdown(
     """
     <style>
+    /* Use Streamlit's own theme variables instead of fixed colors, so this
+       adapts correctly whether the user has a light or dark theme active. */
     div[data-testid="stMetric"] {
-        background-color: white;
-        border: 1px solid #E3EEEE;
+        background-color: var(--secondary-background-color);
+        border: 1px solid rgba(128, 128, 128, 0.25);
         border-radius: 10px;
         padding: 12px 16px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
     section[data-testid="stSidebar"] {
-        background-color: #F0F7F7;
+        background-color: var(--secondary-background-color);
     }
     </style>
     """,
