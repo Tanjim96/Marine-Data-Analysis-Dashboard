@@ -1,221 +1,325 @@
-import streamlit as st
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
-import difflib
+"""
+Marine Data Analysis Dashboard
+--------------------------------
+Interactive Streamlit dashboard for exploring trawler fishing catch data:
+catch volumes by species, fleet efficiency, and per-trawler lookup.
 
-# Configure the page
+Run with:  streamlit run marine_dashboard.py
+Expects CSV files inside a ./data folder (e.g. shrimp.csv, fish_trawler.csv).
+"""
+
+import difflib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# --------------------------------------------------------------------------
+# Page configuration & light theming
+# --------------------------------------------------------------------------
 st.set_page_config(
     page_title="Marine Data Analysis Dashboard",
     page_icon="🚢",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+PRIMARY_COLOR = "#0E7C7B"
 
-# Cache data loading
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetric"] {
+        background-color: white;
+        border: 1px solid #E3EEEE;
+        border-radius: 10px;
+        padding: 12px 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    section[data-testid="stSidebar"] {
+        background-color: #F0F7F7;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+DATA_DIR = Path("data")
+EXCLUDED_COLS = {"Sl. No", "Trawler Name", "Fishing Days", "Total", "Efficiency", "Rank"}
+FALLBACK_FILES = ["shrimp.csv", "fish_trawler.csv", "midwater.csv", "trial.csv"]
+
+
+# --------------------------------------------------------------------------
+# Data loading & processing
+# --------------------------------------------------------------------------
 @st.cache_data
-def load_dataset(filename):
-    df = pd.read_csv(Path("data") / filename)
+def discover_datasets(data_dir: Path) -> list[str]:
+    """Find every CSV file actually present in the data directory."""
+    if not data_dir.exists():
+        return []
+    return sorted(f.name for f in data_dir.glob("*.csv"))
 
-    # Handle different column names for Total
-    if 'Total (Kg)' in df.columns:
-        df = df.rename(columns={'Total (Kg)': 'Total'})
 
-    # Remove 'Sl. No' if it exists
-    if 'Sl. No' in df.columns:
-        df = df.drop('Sl. No', axis=1)
+@st.cache_data
+def load_dataset(filename: str) -> pd.DataFrame:
+    """Load and lightly clean a trawler catch CSV file."""
+    df = pd.read_csv(DATA_DIR / filename)
+
+    if "Total (Kg)" in df.columns:
+        df = df.rename(columns={"Total (Kg)": "Total"})
+    if "Sl. No" in df.columns:
+        df = df.drop(columns="Sl. No")
+
+    required = {"Trawler Name", "Fishing Days", "Total"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Dataset is missing required column(s): {', '.join(sorted(missing))}")
+
+    # Coerce every numeric column, turning stray blanks/text into 0 instead of crashing
+    numeric_cols = [c for c in df.columns if c != "Trawler Name"]
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
     return df
 
 
 @st.cache_data
-def calculate_efficiency(df):
+def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
+    """Add per-day catch efficiency and a fleet-wide rank (safe against 0 fishing days)."""
     df = df.copy()
-    df['Efficiency'] = df['Total'] / df['Fishing Days']
-    df['Rank'] = df['Efficiency'].rank(ascending=False, method="min").astype(int)
+    safe_days = df["Fishing Days"].replace(0, np.nan)
+    df["Efficiency"] = (df["Total"] / safe_days).fillna(0)
+    df["Rank"] = df["Efficiency"].rank(ascending=False, method="min").astype(int)
     return df
 
 
-def get_fish_columns(df, dataset_type):
-    """Get relevant fish columns based on dataset type"""
-    exclude_cols = ['Sl. No', 'Trawler Name', 'Fishing Days', 'Total', 'Efficiency', 'Rank']
+def get_species_groups(df: pd.DataFrame, dataset_type: str) -> dict[str, list[str]]:
+    """Group selectable species columns; shrimp datasets get split into two groups."""
+    if dataset_type == "shrimp":
+        shrimp_cols = [c for c in df.columns if "Shrimp" in c and c != "Total Shrimp"]
+        other_cols = [
+            c for c in df.columns
+            if c not in EXCLUDED_COLS and c not in shrimp_cols and c != "Total Shrimp"
+        ]
+        groups: dict[str, list[str]] = {}
+        if shrimp_cols:
+            groups["Shrimp Species"] = shrimp_cols
+        if other_cols:
+            groups["Other Fish"] = other_cols
+        return groups
 
-    if dataset_type == 'shrimp':
-        # For shrimp dataset, group columns by type
-        shrimp_cols = [col for col in df.columns if 'Shrimp' in col and col != 'Total Shrimp']
-        fish_cols = [col for col in df.columns if col not in exclude_cols + shrimp_cols + ['Total Shrimp']]
-        return {
-            'Shrimp Species': shrimp_cols,
-            'Other Fish': fish_cols
-        }
-    else:
-        # For regular datasets
-        return {
-            'Fish Species': [col for col in df.columns if col not in exclude_cols]
-        }
-
-
-def create_top_trawlers_chart(df, selected_fish):
-    """Create a stacked bar chart for top 5 trawlers with distinct colors for each fish"""
-    # Calculate total for ranking
-    df["Total_Selected"] = df[selected_fish].sum(axis=1)
-    top5_trawlers = df.nlargest(5, "Total_Selected")
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    # Create stacked bars with different colors for each fish type
-    bottom = np.zeros(len(top5_trawlers))
-    # Use different color palettes for shrimp and fish
-    if any('Shrimp' in fish for fish in selected_fish):
-        palette = sns.color_palette("Reds_r", n_colors=len(selected_fish))
-    else:
-        palette = sns.color_palette("husl", n_colors=len(selected_fish))
-
-    for idx, fish in enumerate(selected_fish):
-        values = top5_trawlers[fish].values
-        ax.barh(top5_trawlers['Trawler Name'], values, left=bottom,
-                label=fish, color=palette[idx])
-        bottom += values
-
-    # Add value labels on bars
-    for i, total in enumerate(top5_trawlers["Total_Selected"]):
-        ax.text(total, i, f' {total:,.0f}', va='center')
-
-    ax.set_title("Top 5 Trawlers by Selected Species Catch")
-    ax.set_xlabel("Total Catch (Kg)")
-    plt.legend(title="Species", bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    return fig
+    return {"Fish Species": [c for c in df.columns if c not in EXCLUDED_COLS]}
 
 
-def create_efficiency_chart(df, num_trawlers=5):
-    """Create an efficiency bar chart for top N trawlers"""
-    top_trawlers_efficiency = df.nlargest(num_trawlers, 'Efficiency')[['Trawler Name', 'Efficiency']]
+# --------------------------------------------------------------------------
+# Chart builders — Plotly, so every bar/slice is hoverable and zoomable
+# --------------------------------------------------------------------------
+def chart_top_trawlers(df: pd.DataFrame, species: list[str], top_n: int) -> go.Figure:
+    """Stacked horizontal bar chart of the top N trawlers by selected species."""
+    work = df[["Trawler Name"] + species].copy()
+    work["Total Selected"] = work[species].sum(axis=1)
+    top = work.nlargest(top_n, "Total Selected").sort_values("Total Selected")
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    sns.barplot(
-        data=top_trawlers_efficiency,
-        x='Trawler Name',
-        y='Efficiency',
-        palette="plasma",
-        ax=ax
+    fig = go.Figure()
+    for sp in species:
+        fig.add_trace(go.Bar(
+            y=top["Trawler Name"], x=top[sp], name=sp, orientation="h",
+            hovertemplate=f"<b>%{{y}}</b><br>{sp}: %{{x:,.0f}} kg<extra></extra>",
+        ))
+    fig.update_layout(
+        barmode="stack",
+        title=f"Top {top_n} Trawlers by Selected Species Catch",
+        xaxis_title="Total Catch (Kg)", yaxis_title="",
+        legend_title="Species", height=420,
+        margin=dict(l=10, r=10, t=50, b=10),
     )
-
-    # Add value labels
-    for i, v in enumerate(top_trawlers_efficiency["Efficiency"]):
-        ax.text(i, v, f'{v:.2f}', ha='center', va='bottom')
-
-    plt.xticks(rotation=45, ha='right')
-    ax.set_title(f"Top {num_trawlers} Trawlers by Efficiency")
-    ax.set_ylabel("Efficiency (Catch/Day)")
-    plt.tight_layout()
     return fig
 
 
-def create_all_trawlers_efficiency_chart(df):
-    """Create a bar chart for all trawlers' efficiency"""
-    sorted_df = df.sort_values(by='Efficiency', ascending=False)
-
-    fig, ax = plt.subplots(figsize=(16, 8))
-    sns.barplot(
-        data=sorted_df,
-        x='Trawler Name',
-        y='Efficiency',
-        palette="plasma",
-        ax=ax
+def chart_efficiency(df: pd.DataFrame, top_n: int) -> go.Figure:
+    """Bar chart of the top N most efficient trawlers (catch per fishing day)."""
+    top = df.nlargest(top_n, "Efficiency").sort_values("Efficiency")
+    fig = px.bar(
+        top, x="Efficiency", y="Trawler Name", orientation="h",
+        color="Efficiency", color_continuous_scale="Teal",
+        text=top["Efficiency"].round(2),
     )
-
-    plt.xticks(rotation=90)
-    ax.set_title('All Trawlers by Fish Catching Efficiency')
-    ax.set_ylabel("Efficiency (Catch/Day)")
-    plt.tight_layout()
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        title=f"Top {top_n} Trawlers by Efficiency (Catch/Day)",
+        height=420, coloraxis_showscale=False,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
     return fig
 
 
-def main():
-    st.title("Marine Data Analysis Dashboard 🚢🐟")
+def chart_all_efficiency(df: pd.DataFrame) -> go.Figure:
+    """Fleet-wide efficiency ranking across every trawler in the dataset."""
+    sorted_df = df.sort_values("Efficiency", ascending=False)
+    fig = px.bar(
+        sorted_df, x="Trawler Name", y="Efficiency",
+        color="Efficiency", color_continuous_scale="Teal",
+    )
+    fig.update_layout(
+        title="Fleet-wide Efficiency Ranking",
+        xaxis_tickangle=-90, height=450,
+        coloraxis_showscale=False,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    return fig
 
-    # Sidebar
-    st.sidebar.header("Data Selection")
 
-    # File selection dropdown
-    available_files = ["shrimp.csv", "fish_trawler.csv", "midwater.csv", "trial.csv"]
-    selected_file = st.sidebar.selectbox("Select Dataset:", available_files)
+def chart_species_share(df: pd.DataFrame, species: list[str]) -> go.Figure:
+    """Donut chart showing each selected species' share of total fleet catch."""
+    totals = df[species].sum().sort_values(ascending=False)
+    fig = px.pie(
+        values=totals.values, names=totals.index, hole=0.45,
+        color_discrete_sequence=px.colors.sequential.Teal_r,
+    )
+    fig.update_traces(textinfo="percent+label")
+    fig.update_layout(title="Fleet-wide Species Share", height=420, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def chart_efficiency_distribution(df: pd.DataFrame) -> go.Figure:
+    """Histogram showing how efficiency is distributed across the fleet."""
+    fig = px.histogram(df, x="Efficiency", nbins=20, color_discrete_sequence=[PRIMARY_COLOR])
+    fig.update_layout(
+        title="Distribution of Trawler Efficiency",
+        xaxis_title="Efficiency (Catch/Day)", yaxis_title="Number of Trawlers",
+        height=350, margin=dict(l=10, r=10, t=50, b=10),
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------
+# UI sections
+# --------------------------------------------------------------------------
+def render_kpis(df: pd.DataFrame) -> None:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Trawlers", f"{len(df):,}")
+    c2.metric("Total Catch", f"{df['Total'].sum():,.0f} kg")
+    c3.metric("Avg Efficiency", f"{df['Efficiency'].mean():.2f} kg/day")
+    top_trawler = df.loc[df["Efficiency"].idxmax(), "Trawler Name"] if len(df) else "—"
+    c4.metric("Top Performer", top_trawler)
+
+
+def render_search(df: pd.DataFrame) -> None:
+    st.subheader("🔍 Trawler Lookup")
+    names = df["Trawler Name"].tolist()
+    choice = st.selectbox("Pick a trawler:", options=["—"] + names, index=0)
+
+    query = None
+    if choice != "—":
+        query = choice
+    else:
+        typed = st.text_input("...or search by partial / misspelled name:")
+        if typed:
+            matches = difflib.get_close_matches(typed, names, n=3, cutoff=0.5)
+            if matches:
+                query = st.radio("Closest matches:", matches, horizontal=True)
+            else:
+                st.error("No matching trawler found.")
+
+    if query:
+        row = df[df["Trawler Name"] == query].iloc[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Rank", f"#{int(row['Rank'])} of {len(df)}")
+        m2.metric("Efficiency", f"{row['Efficiency']:.2f} kg/day")
+        m3.metric("Total Catch", f"{row['Total']:,.0f} kg")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def main() -> None:
+    st.title("🚢🐟 Marine Data Analysis Dashboard")
+    st.caption("Explore trawler catch volumes, species composition, and fishing efficiency across the fleet.")
+
+    st.sidebar.header("📂 Data Selection")
+    available_files = discover_datasets(DATA_DIR) or FALLBACK_FILES
+    selected_file = st.sidebar.selectbox("Dataset:", available_files)
 
     try:
-        # Load and process data
         df = load_dataset(selected_file)
-        df = calculate_efficiency(df)
-
-        # Determine dataset type and get appropriate columns
-        dataset_type = 'shrimp' if selected_file == 'shrimp.csv' else 'regular'
-        species_groups = get_fish_columns(df, dataset_type)
-
-        # Create species selection for each group
-        selected_fish = []
-        for group_name, species_list in species_groups.items():
-            st.sidebar.subheader(group_name)
-            selected = st.sidebar.multiselect(
-                f"Select {group_name}:",
-                species_list,
-                default=[species_list[0]] if species_list else None
-            )
-            selected_fish.extend(selected)
-
-        if not selected_fish:
-            st.warning("Please select at least one species to analyze.")
-            return
-
-        # Layout using columns
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("Top 5 Trawlers by Catch")
-            fig_top5 = create_top_trawlers_chart(df, selected_fish)
-            st.pyplot(fig_top5)
-
-            st.subheader("Trawler Search")
-            search_trawler = st.text_input("Enter Trawler Name:")
-            if search_trawler:
-                matches = difflib.get_close_matches(
-                    search_trawler,
-                    df['Trawler Name'],
-                    n=1,
-                    cutoff=0.6
-                )
-                if matches:
-                    trawler = matches[0]
-                    trawler_data = df[df['Trawler Name'] == trawler].iloc[0]
-
-                    st.success(f"Found: {trawler}")
-                    metrics_col1, metrics_col2 = st.columns(2)
-                    with metrics_col1:
-                        st.metric("Rank", f"#{trawler_data['Rank']}")
-                    with metrics_col2:
-                        st.metric("Efficiency", f"{trawler_data['Efficiency']:.2f}")
-                else:
-                    st.error("No matching trawler found.")
-
-        with col2:
-            st.subheader("Top Trawlers Efficiency")
-            fig_eff = create_efficiency_chart(df)
-            st.pyplot(fig_eff)
-
-            st.subheader("All Trawlers Efficiency")
-            fig_all = create_all_trawlers_efficiency_chart(df)
-            st.pyplot(fig_all)
-
-        # Display raw data with toggle
-        if st.sidebar.checkbox("Show Raw Data"):
-            st.subheader("Raw Data")
-            st.dataframe(df)
-
     except FileNotFoundError:
-        st.error("Please ensure the data files are in the 'data' directory.")
+        st.error(f"Couldn't find `{selected_file}` inside the `data/` folder. Add the CSV and reload.")
+        return
+    except ValueError as e:
+        st.error(str(e))
+        return
     except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+        st.error(f"Couldn't read `{selected_file}`: {e}")
+        return
+
+    if df.empty:
+        st.warning("This dataset is empty.")
+        return
+
+    df = calculate_efficiency(df)
+    dataset_type = "shrimp" if "shrimp" in selected_file.lower() else "regular"
+    species_groups = get_species_groups(df, dataset_type)
+
+    st.sidebar.header("🐟 Species Filter")
+    selected_species: list[str] = []
+    for group_name, species_list in species_groups.items():
+        with st.sidebar.expander(group_name, expanded=True):
+            default = species_list[:3]
+            picked = st.multiselect(f"Select {group_name.lower()}:", species_list, default=default, key=group_name)
+            selected_species.extend(picked)
+
+    st.sidebar.header("⚙️ Display Options")
+    n_trawlers = len(df)
+    if n_trawlers <= 1:
+        # Slider needs min_value != max_value, so skip it for tiny datasets
+        top_n = n_trawlers
+        st.sidebar.caption(f"Only {n_trawlers} trawler in this dataset — showing it directly.")
+    else:
+        max_n = min(20, n_trawlers)
+        top_n = st.sidebar.slider(
+            "Number of trawlers to highlight:", min_value=1, max_value=max_n, value=min(5, max_n)
+        )
+
+    render_kpis(df)
+    st.divider()
+
+    tab_overview, tab_efficiency, tab_species, tab_search, tab_data = st.tabs(
+        ["📊 Overview", "⚡ Efficiency", "🐠 Species Mix", "🔍 Trawler Lookup", "📄 Raw Data"]
+    )
+
+    with tab_overview:
+        if selected_species:
+            st.plotly_chart(chart_top_trawlers(df, selected_species, top_n), width='stretch')
+        else:
+            st.info("Pick species in the sidebar to see the top-catch chart.")
+
+    with tab_efficiency:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(chart_efficiency(df, top_n), width='stretch')
+        with col2:
+            st.plotly_chart(chart_efficiency_distribution(df), width='stretch')
+        st.plotly_chart(chart_all_efficiency(df), width='stretch')
+
+    with tab_species:
+        if selected_species:
+            st.plotly_chart(chart_species_share(df, selected_species), width='stretch')
+        else:
+            st.info("Pick species in the sidebar to see the fleet-wide species mix.")
+
+    with tab_search:
+        render_search(df)
+
+    with tab_data:
+        st.dataframe(df, width='stretch')
+        st.download_button(
+            "⬇️ Download this dataset as CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name=f"processed_{selected_file}",
+            mime="text/csv",
+        )
 
 
 if __name__ == "__main__":
