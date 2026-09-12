@@ -9,6 +9,7 @@ Expects CSV files inside a ./data folder (e.g. shrimp.csv, fish_trawler.csv).
 """
 
 import difflib
+import re
 from pathlib import Path
 
 import numpy as np
@@ -43,14 +44,53 @@ st.markdown(
     section[data-testid="stSidebar"] {
         background-color: var(--secondary-background-color);
     }
+    /* Keep the app from scrolling sideways on narrow phone screens */
+    .main .block-container {
+        max-width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-x: hidden;
+    }
+    div[data-testid="stPlotlyChart"] {
+        max-width: 100%;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# Charts render with the toolbar hidden and panning/zooming disabled — on a
+# phone, a finger-drag on a chart otherwise gets captured as a zoom gesture
+# instead of scrolling the page, which is what actually makes charts feel
+# "broken" on mobile even though nothing has technically crashed.
+PLOTLY_MOBILE_CONFIG = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False}
+
+
+def _mobile_friendly(fig: go.Figure) -> go.Figure:
+    """Disable drag/zoom (so touch-scroll passes through) and auto-fit axis labels."""
+    fig.update_layout(dragmode=False)
+    fig.update_xaxes(fixedrange=True, automargin=True)
+    fig.update_yaxes(fixedrange=True, automargin=True)
+    return fig
+
 DATA_DIR = Path("data")
 EXCLUDED_COLS = {"Sl. No", "Trawler Name", "Fishing Days", "Total", "Efficiency", "Rank"}
 FALLBACK_FILES = ["shrimp.csv", "fish_trawler.csv", "midwater.csv", "trial.csv"]
+
+# Serial-number-style columns show up with all sorts of punctuation across
+# CSVs ("Sl. No", "Sl. No.", "SL NO", "Sr. No", "S.No", ...) so we match on a
+# normalized form instead of one exact string.
+_SERIAL_ALIASES = {"slno", "srno", "sno", "serialno", "serial"}
+_EXCLUDED_NORM = {re.sub(r"[^a-z0-9]", "", c.lower()) for c in EXCLUDED_COLS} | _SERIAL_ALIASES
+
+
+def _norm(col: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", col.lower())
+
+
+def _is_metadata_col(col: str) -> bool:
+    """True for id/metadata columns that should never appear as a selectable species."""
+    return _norm(col) in _EXCLUDED_NORM
 
 
 # --------------------------------------------------------------------------
@@ -71,8 +111,10 @@ def load_dataset(filename: str) -> pd.DataFrame:
 
     if "Total (Kg)" in df.columns:
         df = df.rename(columns={"Total (Kg)": "Total"})
-    if "Sl. No" in df.columns:
-        df = df.drop(columns="Sl. No")
+
+    serial_like = [c for c in df.columns if _norm(c) in _SERIAL_ALIASES]
+    if serial_like:
+        df = df.drop(columns=serial_like)
 
     required = {"Trawler Name", "Fishing Days", "Total"}
     missing = required - set(df.columns)
@@ -102,7 +144,7 @@ def get_species_groups(df: pd.DataFrame, dataset_type: str) -> dict[str, list[st
         shrimp_cols = [c for c in df.columns if "Shrimp" in c and c != "Total Shrimp"]
         other_cols = [
             c for c in df.columns
-            if c not in EXCLUDED_COLS and c not in shrimp_cols and c != "Total Shrimp"
+            if not _is_metadata_col(c) and c not in shrimp_cols and c != "Total Shrimp"
         ]
         groups: dict[str, list[str]] = {}
         if shrimp_cols:
@@ -111,7 +153,7 @@ def get_species_groups(df: pd.DataFrame, dataset_type: str) -> dict[str, list[st
             groups["Other Fish"] = other_cols
         return groups
 
-    return {"Fish Species": [c for c in df.columns if c not in EXCLUDED_COLS]}
+    return {"Fish Species": [c for c in df.columns if not _is_metadata_col(c)]}
 
 
 # --------------------------------------------------------------------------
@@ -133,10 +175,13 @@ def chart_top_trawlers(df: pd.DataFrame, species: list[str], top_n: int) -> go.F
         barmode="stack",
         title=f"Top {top_n} Trawlers by Selected Species Catch",
         xaxis_title="Total Catch (Kg)", yaxis_title="",
-        legend_title="Species", height=420,
+        height=max(360, 55 * len(top)),
+        # Legend along the bottom instead of the side — a side legend eats
+        # too much horizontal space on a narrow phone screen.
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    return fig
+    return _mobile_friendly(fig)
 
 
 def chart_efficiency(df: pd.DataFrame, top_n: int) -> go.Figure:
@@ -150,26 +195,32 @@ def chart_efficiency(df: pd.DataFrame, top_n: int) -> go.Figure:
     fig.update_traces(textposition="outside")
     fig.update_layout(
         title=f"Top {top_n} Trawlers by Efficiency (Catch/Day)",
-        height=420, coloraxis_showscale=False,
+        height=max(360, 45 * len(top)), coloraxis_showscale=False,
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    return fig
+    return _mobile_friendly(fig)
 
 
 def chart_all_efficiency(df: pd.DataFrame) -> go.Figure:
-    """Fleet-wide efficiency ranking across every trawler in the dataset."""
-    sorted_df = df.sort_values("Efficiency", ascending=False)
+    """Fleet-wide efficiency ranking across every trawler in the dataset.
+
+    Horizontal, with height scaled to the fleet size — that way trawler names
+    are always fully readable and the user just scrolls down for more, rather
+    than fighting with dozens of tiny rotated x-axis labels on a phone.
+    """
+    sorted_df = df.sort_values("Efficiency", ascending=True)
     fig = px.bar(
-        sorted_df, x="Trawler Name", y="Efficiency",
+        sorted_df, x="Efficiency", y="Trawler Name", orientation="h",
         color="Efficiency", color_continuous_scale="Teal",
     )
     fig.update_layout(
         title="Fleet-wide Efficiency Ranking",
-        xaxis_tickangle=-90, height=450,
+        xaxis_title="Efficiency (Catch/Day)", yaxis_title="",
+        height=max(400, 22 * len(sorted_df)),
         coloraxis_showscale=False,
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    return fig
+    return _mobile_friendly(fig)
 
 
 def chart_species_share(df: pd.DataFrame, species: list[str]) -> go.Figure:
@@ -180,7 +231,11 @@ def chart_species_share(df: pd.DataFrame, species: list[str]) -> go.Figure:
         color_discrete_sequence=px.colors.sequential.Teal_r,
     )
     fig.update_traces(textinfo="percent+label")
-    fig.update_layout(title="Fleet-wide Species Share", height=420, margin=dict(l=10, r=10, t=50, b=10))
+    fig.update_layout(
+        title="Fleet-wide Species Share", height=420,
+        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="center", x=0.5),
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
     return fig
 
 
@@ -192,7 +247,7 @@ def chart_efficiency_distribution(df: pd.DataFrame) -> go.Figure:
         xaxis_title="Efficiency (Catch/Day)", yaxis_title="Number of Trawlers",
         height=350, margin=dict(l=10, r=10, t=50, b=10),
     )
-    return fig
+    return _mobile_friendly(fig)
 
 
 # --------------------------------------------------------------------------
@@ -292,21 +347,21 @@ def main() -> None:
 
     with tab_overview:
         if selected_species:
-            st.plotly_chart(chart_top_trawlers(df, selected_species, top_n), width='stretch')
+            st.plotly_chart(chart_top_trawlers(df, selected_species, top_n), width='stretch', config=PLOTLY_MOBILE_CONFIG)
         else:
             st.info("Pick species in the sidebar to see the top-catch chart.")
 
     with tab_efficiency:
         col1, col2 = st.columns(2)
         with col1:
-            st.plotly_chart(chart_efficiency(df, top_n), width='stretch')
+            st.plotly_chart(chart_efficiency(df, top_n), width='stretch', config=PLOTLY_MOBILE_CONFIG)
         with col2:
-            st.plotly_chart(chart_efficiency_distribution(df), width='stretch')
-        st.plotly_chart(chart_all_efficiency(df), width='stretch')
+            st.plotly_chart(chart_efficiency_distribution(df), width='stretch', config=PLOTLY_MOBILE_CONFIG)
+        st.plotly_chart(chart_all_efficiency(df), width='stretch', config=PLOTLY_MOBILE_CONFIG)
 
     with tab_species:
         if selected_species:
-            st.plotly_chart(chart_species_share(df, selected_species), width='stretch')
+            st.plotly_chart(chart_species_share(df, selected_species), width='stretch', config=PLOTLY_MOBILE_CONFIG)
         else:
             st.info("Pick species in the sidebar to see the fleet-wide species mix.")
 
